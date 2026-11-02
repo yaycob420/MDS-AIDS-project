@@ -218,3 +218,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Custom Colab and Cloudflare files
+cloudflared
+logs.txt
