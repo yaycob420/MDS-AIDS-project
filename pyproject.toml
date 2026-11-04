@@ -1,0 +1,18 @@
+[project]
+name = "actg175-app"
+version = "1.0.0"
+description = "Streamlit app for the ACTG 175 semestral project: EDA, classification models A/B/C, and inference / causal analysis"
+requires-python = ">=3.10"
+dependencies = [
+    "streamlit>=1.42",
+    "scikit-learn>=1.3",
+    "pandas>=2.0",
+    "numpy>=1.24",
+    "scipy",
+    "matplotlib>=3.7",
+    "ucimlrepo",
+]
+
+# This is an app, not a library: nothing to build or import, only dependencies to install.
+[tool.setuptools]
+py-modules = []
