@@ -13,6 +13,7 @@ Data: downloaded from UCI (ucimlrepo id=890). If you have no internet, put the C
 app.py as "actg175.csv" or upload it in the app.
 """
 import warnings
+from itertools import combinations
 from pathlib import Path
 
 import matplotlib
@@ -146,6 +147,10 @@ MODEL_NAME = {"A": "A - Elastic-net logistic regression",
               "C": "C - Spline logistic regression (GAM)"}
 INK, MUTED, GRID, SURFACE = "#1d2433", "#6b7280", "#e5e7ec", "#ffffff"
 LIGHT = "#b8bfcf"                                   # light slate for secondary marks
+# treatment arms: grey = control (ZDV only), navy shades = the other arms; lines get a darker tone + a dash style
+ARM_COLOR = {0: "#8b919c", 1: ACCENT, 2: "#5b7bb5", 3: "#aebbd6"}
+ARM_LINE = {0: "#6f7580", 1: ACCENT, 2: "#5b7bb5", 3: "#7f93bd"}
+ARM_STYLE = {0: "--", 1: "-", 2: "-.", 3: ":"}
 
 
 from matplotlib.colors import LinearSegmentedColormap  # noqa: E402
@@ -266,8 +271,7 @@ def make_C(C=1.0, feats=FEATURES):
         parts.append(("cat", OneHotEncoder(drop="first", handle_unknown="ignore", sparse_output=False), cat))
     pre = ColumnTransformer(parts, remainder="drop")
     return Pipeline([("pre", pre),
-                     ("clf", LogisticRegression(penalty="l2", solver="lbfgs", C=C, max_iter=3000,
-                                                random_state=SEED))])
+                     ("clf", LogisticRegression(solver="lbfgs", C=C, max_iter=3000, random_state=SEED))])
 
 
 def build(name, p, feats=FEATURES):
@@ -471,19 +475,26 @@ def threshold_table(y, p, thresholds=THRESHOLDS):
         fp, tn = int((flag & (y == 0)).sum()), int((~flag & (y == 0)).sum())
         rows.append({"threshold": t, "flagged": flag.mean(), "sensitivity": tp / max(tp + fn, 1),
                      "specificity": tn / max(tn + fp, 1), "precision": tp / (tp + fp) if tp + fp else np.nan,
-                     "missed events": fn})
+                     "missed events": fn, "false alarms": fp})
     return pd.DataFrame(rows)
+
+
+def best_threshold(tt, fn_weight):
+    """Threshold with the lowest cost = fn_weight * missed events + false alarms (ties -> lower threshold)."""
+    cost = fn_weight * tt["missed events"] + tt["false alarms"]
+    return float(tt.loc[cost.idxmin(), "threshold"])
 
 
 def fig_confusion(y, p, t):
     flag = (np.asarray(p) >= t).astype(int)
     cm = confusion_matrix(y, flag, labels=[0, 1])
-    fig, ax = new_fig(w=3.6, h=3.2)
+    fig, ax = new_fig(w=4.2, h=3.4)
     ax.grid(False)
     ax.imshow(cm, cmap=SEQUENTIAL)
+    names = [["true negatives", "false alarms"], ["missed events", "caught events"]]
     for i in range(2):
         for j in range(2):
-            ax.text(j, i, cm[i, j], ha="center", va="center", fontsize=13,
+            ax.text(j, i, f"{cm[i, j]}\n{names[i][j]}", ha="center", va="center", fontsize=11,
                     color="white" if cm[i, j] > cm.max() / 2 else INK)
     ax.set_xticks([0, 1], ["no event", "event"])
     ax.set_yticks([0, 1], ["no event", "event"])
@@ -579,7 +590,8 @@ CSS = """
 
 PAGES = [("explore", "Explore data", ":material/monitoring:"),
          ("model", "Modelling", ":material/tune:"),
-         ("results", "Results", ":material/leaderboard:")]
+         ("results", "Results", ":material/leaderboard:"),
+         ("causal", "Inference & causal", ":material/science:")]
 
 
 def banner():
@@ -600,6 +612,193 @@ def sidebar_nav():
         st.sidebar.button(label, icon=icon, key=f"nav_{key}", on_click=set_page, args=(key,),
                           type="primary" if st.session_state["page"] == key else "secondary")
     return st.session_state["page"]
+
+
+# ----------------------------------------------------------------------------------------
+# Small widget helpers (st.pills = clickable buttons that stay highlighted when selected)
+# ----------------------------------------------------------------------------------------
+SHORT = {"age": "Age", "wtkg": "Weight", "karnof": "Karnofsky score", "cd40": "CD4", "cd80": "CD8",
+         "preanti": "Prior therapy days", "hemo": "Hemophilia", "homo": "Homosexual activity",
+         "drugs": "IV drug use", "oprior": "Non-ZDV prior therapy", "z30": "ZDV last 30 days", "race": "Race",
+         "gender": "Sex", "symptom": "Symptoms", "trt": "Treatment arm", "strat": "Therapy history"}
+
+
+def feat_label(c):
+    short = SHORT.get(c, c)
+    return short if short.lower() == c else f"{short} ({c})"
+
+
+def pick_many(label, options, key, format_func=str):
+    """Click-to-toggle buttons; the selection list lives in st.session_state[key]."""
+    if hasattr(st, "pills"):
+        return st.pills(label, options, selection_mode="multi", key=key, format_func=format_func,
+                        label_visibility="collapsed")
+    return st.multiselect(label, options, key=key, format_func=format_func, label_visibility="collapsed")
+
+
+def pick_one(label, options, default, key, format_func=str):
+    """Single choice as buttons; falls back to `default` when the user un-selects."""
+    if hasattr(st, "pills"):
+        v = st.pills(label, options, selection_mode="single", default=default, key=key, format_func=format_func)
+        return default if v is None else v
+    return st.radio(label, options, index=list(options).index(default), key=key, format_func=format_func,
+                    horizontal=True)
+
+
+# ----------------------------------------------------------------------------------------
+# Inference (Kaplan-Meier at day 730, notebook cells 89-91) and causal estimate (cell 94)
+# ----------------------------------------------------------------------------------------
+Z95 = 1.959963984540054
+BOOT_N = 1000
+CAUSAL_BIN, CAUSAL_CAT = ["z30", "symptom"], ["strat"]
+# Values printed by the notebook (1,000 bootstrap resamples)
+CAUSAL_NOTEBOOK = {"risk0": 0.2554, "risk1": 0.1261, "ate": -0.1294, "ci": (-0.1755, -0.0849)}
+
+
+def arm_label(a):
+    return f"Arm {a} · {TRT[a]}"
+
+
+def km_curve(time, event):
+    """Kaplan-Meier estimate with Greenwood standard error, evaluated at the event times."""
+    t, e = np.asarray(time, float), np.asarray(event, int)
+    times = np.unique(t[e == 1])
+    n_at = np.array([(t >= u).sum() for u in times], float)
+    d = np.array([((t == u) & (e == 1)).sum() for u in times], float)
+    surv = np.cumprod(1 - d / n_at)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        term = np.where(n_at > d, d / (n_at * (n_at - d)), np.nan)
+    return times, surv, surv * np.sqrt(np.cumsum(term))
+
+
+def km_at(time, event, t0=H):
+    """Event-free probability at t0 with a 95% log-log confidence interval."""
+    times, surv, se = km_curve(time, event)
+    i = np.searchsorted(times, t0, side="right") - 1
+    if i < 0:
+        return {"prob": 1.0, "se": 0.0, "lo": 1.0, "hi": 1.0}
+    p, s_ = surv[i], se[i]
+    ll, sll = np.log(-np.log(p)), s_ / abs(p * np.log(p))
+    return {"prob": p, "se": s_, "lo": np.exp(-np.exp(ll + Z95 * sll)), "hi": np.exp(-np.exp(ll - Z95 * sll))}
+
+
+@st.cache_resource(show_spinner=False)
+def inference_results(_raw):
+    arms = sorted(_raw["trt"].unique())
+    tab = pd.DataFrame({a: km_at(_raw.loc[_raw.trt == a, "time"], _raw.loc[_raw.trt == a, "cid"]) for a in arms}).T
+    curves = {a: km_curve(_raw.loc[_raw.trt == a, "time"], _raw.loc[_raw.trt == a, "cid"])[:2] for a in arms}
+    rows = []
+    for b, a in combinations(arms, 2):               # "Arm a vs Arm b" = P(a) - P(b), as in the notebook
+        diff = tab.loc[a, "prob"] - tab.loc[b, "prob"]
+        se = np.sqrt(tab.loc[a, "se"] ** 2 + tab.loc[b, "se"] ** 2)
+        rows.append({"comparison": f"Arm {int(a)} vs Arm {int(b)}", "difference": diff,
+                     "lo": diff - Z95 * se, "hi": diff + Z95 * se})
+    return tab, curves, pd.DataFrame(rows)
+
+
+def _unpenalized():
+    major, minor = (int(x) for x in sklearn.__version__.split(".")[:2])
+    if (major, minor) >= (1, 8):                      # penalty=None is deprecated; C=inf means no penalty
+        return LogisticRegression(C=np.inf, solver="lbfgs", max_iter=2000)
+    return LogisticRegression(penalty=None, solver="lbfgs", max_iter=2000)
+
+
+@st.cache_resource(show_spinner=False)
+def causal_fit(_raw):
+    """Arms 0 vs 1, unpenalised logistic regression + marginal standardisation (g-computation)."""
+    d = _raw[_raw.trt.isin([0, 1])].copy()
+    d["event_730"] = ((d.time <= H) & (d.cid == 1)).astype(int)
+    pre = ColumnTransformer([("num", StandardScaler(), NUM_COLS + LOG_COLS),
+                             ("bin", "passthrough", CAUSAL_BIN),
+                             ("cat", OneHotEncoder(drop="first", sparse_output=False), CAUSAL_CAT)],
+                            remainder="passthrough")
+    pre.set_output(transform="pandas")
+    Z = pre.fit_transform(d[LOG_COLS + NUM_COLS + CAUSAL_BIN + CAUSAL_CAT + ["trt"]])
+    y = d["event_730"].to_numpy()
+    model = _unpenalized().fit(Z, y)
+    Z0, Z1 = Z.copy(), Z.copy()
+    Z0["remainder__trt"], Z1["remainder__trt"] = 0, 1
+    p0, p1 = model.predict_proba(Z0)[:, 1], model.predict_proba(Z1)[:, 1]
+    coef = pd.DataFrame({"feature": [n.split("__")[-1] for n in Z.columns], "log-odds": model.coef_[0]})
+    coef["odds ratio"] = np.exp(coef["log-odds"])
+    return {"Z": Z, "y": y, "Z0": Z0, "Z1": Z1, "p0": p0, "p1": p1, "risk0": float(p0.mean()),
+            "risk1": float(p1.mean()), "ate": float(p1.mean() - p0.mean()), "n": len(d),
+            "coef": coef.sort_values("log-odds").reset_index(drop=True), "intercept": float(model.intercept_[0])}
+
+
+def bootstrap_ate(fit, n=None, seed=SEED):
+    """95% percentile interval for the ATE (the design matrix is built once; for an unpenalised
+    model, re-standardising inside each resample does not change the fitted probabilities)."""
+    n = BOOT_N if n is None else n
+    Z, Z0, Z1, y = (fit[k].to_numpy() if hasattr(fit[k], "to_numpy") else fit[k] for k in ("Z", "Z0", "Z1", "y"))
+    rng = np.random.default_rng(seed)
+    out = np.empty(n)
+    for b in range(n):
+        i = rng.integers(0, len(y), len(y))
+        m = _unpenalized().fit(Z[i], y[i])
+        out[b] = m.predict_proba(Z1[i])[:, 1].mean() - m.predict_proba(Z0[i])[:, 1].mean()
+    return tuple(float(v) for v in np.percentile(out, [2.5, 97.5]))
+
+
+def run_bootstrap(fit):
+    st.session_state["causal_ci"] = bootstrap_ate(fit)
+
+
+def fig_km(curves):
+    fig, ax = new_fig(h=3.8)
+    lo = 1.0
+    for a, (t, sv) in curves.items():
+        x, yv = np.r_[0, t], np.r_[1, sv]
+        ax.step(x, yv, where="post", color=ARM_LINE[a], linestyle=ARM_STYLE[a], linewidth=2, label=arm_label(a))
+        lo = min(lo, np.nanmin(yv[x <= 1200]))
+    ax.axvline(H, color=MUTED, linewidth=1, linestyle="-.")
+    ax.set_xlim(0, 1200)
+    ax.set_ylim(max(0.0, lo - 0.03), 1.0)
+    ax.text(H + 12, ax.get_ylim()[0] + 0.01, "730 days", color=MUTED, fontsize=8)
+    ax.set_xlabel("days")
+    ax.set_ylabel("probability of staying event-free")
+    ax.legend(frameon=False, fontsize=8, loc="lower left")
+    ax.grid(axis="x", color=GRID)
+    return fig
+
+
+def fig_forest(pairs):
+    fig, ax = new_fig(h=max(2.8, 0.55 * len(pairs) + 1.2))
+    ypos = np.arange(len(pairs))[::-1]
+    for yy, r in zip(ypos, pairs.itertuples()):
+        clear = r.lo > 0 or r.hi < 0
+        ax.errorbar(r.difference * 100, yy, xerr=[[(r.difference - r.lo) * 100], [(r.hi - r.difference) * 100]],
+                    fmt="o", color=ACCENT if clear else "#8b919c", capsize=4, markersize=6, linewidth=2)
+    ax.axvline(0, color=MUTED, linewidth=1)
+    ax.set_yticks(ypos, list(pairs["comparison"]))
+    ax.set_ylim(-0.7, len(pairs) - 0.3)
+    ax.grid(axis="y", visible=False)
+    ax.grid(axis="x", color=GRID)
+    ax.set_xlabel("difference in event-free probability at 730 days (percentage points)")
+    return fig
+
+
+def fig_overlay_hist(groups, bins, xlabel):
+    """groups = [(label, values, fill colour, line colour)].
+    Two groups -> overlaid density histograms; more -> side-by-side bars per bin (stays readable)."""
+    allv = np.concatenate([np.asarray(v, float) for _, v, _, _ in groups])
+    edges = np.linspace(allv.min(), allv.max(), bins + 1)
+    fig, ax = new_fig(h=3.5)
+    if len(groups) <= 2:
+        for label, v, fill, line in groups:
+            ax.hist(v, bins=edges, density=True, histtype="stepfilled", color=fill, alpha=0.45)
+            ax.hist(v, bins=edges, density=True, histtype="step", color=line, linewidth=2, label=label)
+    else:
+        _, _, containers = ax.hist([np.asarray(v, float) for _, v, _, _ in groups], bins=edges, density=True,
+                                   color=[g[2] for g in groups], label=[g[0] for g in groups])
+        for cont, g in zip(containers, groups):
+            for patch in cont:
+                patch.set_edgecolor(g[3])
+                patch.set_linewidth(0.6)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel("density")
+    ax.legend(frameon=False, fontsize=8)
+    return fig
 
 
 # ----------------------------------------------------------------------------------------
@@ -810,14 +1009,17 @@ def page_modelling(lab, split):
     name = st.radio("Model", list(MODEL_NAME), format_func=MODEL_NAME.get, horizontal=True)
 
     sel = st.session_state["feat_sel"]
-    with st.expander(f"Baseline features used by the model ({len(sel)} of {len(FEATURES)} selected)", expanded=False):
-        st.caption("Only baseline variables (known at the start of the trial) are offered here. "
-                   "Choose which ones the model may use.")
-        b1, b2, _ = st.columns([1, 1, 4])
-        b1.button("Select all", on_click=set_features, args=(FEATURES,), key="sel_all")
-        b2.button("Clear", on_click=set_features, args=([],), key="sel_none")
-        st.multiselect("Features", FEATURES, key="feat_sel",
-                       format_func=lambda c: f"{c} - {DESC.get(c, '')}", label_visibility="collapsed")
+    with st.container(border=True):
+        h1, h2, h3 = st.columns([6, 1.2, 1])
+        h1.markdown(f"**Baseline features** · {len(sel)} of {len(FEATURES)} selected  \n"
+                    "Click a feature to add or remove it. Highlighted = used by the model. "
+                    "Only variables known at the start of the trial are offered.")
+        h2.button("Select all", on_click=set_features, args=(FEATURES,), key="sel_all")
+        h3.button("Clear", on_click=set_features, args=([],), key="sel_none")
+        pick_many("Features", FEATURES, key="feat_sel", format_func=feat_label)
+        with st.expander("What do the features mean?"):
+            st.dataframe(pd.DataFrame({"feature": FEATURES, "description": [DESC[c] for c in FEATURES]}),
+                         hide_index=True, use_container_width=True)
     feats = [c for c in FEATURES if c in st.session_state["feat_sel"]]
 
     left, right = st.columns([1, 2])
@@ -991,13 +1193,143 @@ def page_results(split):
     st.dataframe(oofs.corr(method="spearman").round(3), use_container_width=True)
     st.caption("Spearman rank correlation of out-of-fold predicted risks.")
 
-    st.subheader("Thresholds")
-    k = st.radio("Model", list("ABC"), format_func=lambda v: MODEL_NAME[v], horizontal=True, key="thr_model")
-    tt = threshold_table(y_train, tuned[k]["oof"])
-    st.dataframe(tt.style.format({"threshold": "{:.2f}", "flagged": "{:.1%}", "sensitivity": "{:.3f}",
-                                  "specificity": "{:.3f}", "precision": "{:.3f}"}),
-                 hide_index=True, use_container_width=True)
-    st.caption("Out-of-fold predictions on the training set. 'Flagged' = share of patients above the threshold.")
+    st.subheader("Thresholds and confusion matrix")
+    st.caption("A threshold turns a predicted risk into a decision: patients at or above it are flagged as "
+               "'will have an event'. Missing a real event is usually worse than a false alarm, so the "
+               "recommended threshold (★) is the one with the lowest cost = missed events × weight + false alarms.")
+    c1, c2 = st.columns([3, 2])
+    with c1:
+        k = st.radio("Model", list("ABC"), format_func=lambda v: MODEL_NAME[v], horizontal=True, key="thr_model")
+    with c2:
+        w = st.slider("One missed event counts as this many false alarms", 1, 10, 5, key="fn_weight")
+    p_k = tuned[k]["oof"]
+    tt = threshold_table(y_train, p_k)
+    best = best_threshold(tt, w)
+    pick = pick_one("Threshold (★ = recommended; click another one to compare)", THRESHOLDS, default=best,
+                    key=f"thr_pick_{k}_{w}",
+                    format_func=lambda t: f"{t:.2f}" + (" ★" if abs(t - best) < 1e-9 else ""))
+    t_sel = best if pick is None else float(pick)
+
+    left, right = st.columns([3, 2])
+    with left:
+        shown = tt.copy()
+        shown.insert(1, "", np.where(np.isclose(shown["threshold"], best), "★", ""))
+
+        def mark(row):
+            hit = np.isclose(row["threshold"], t_sel)
+            return ["background-color: #dfe3ec; font-weight: 700" if hit else ""] * len(row)
+        st.dataframe(shown.style.apply(mark, axis=1)
+                     .format({"threshold": "{:.2f}", "flagged": "{:.1%}", "sensitivity": "{:.3f}",
+                              "specificity": "{:.3f}", "precision": "{:.3f}"}),
+                     hide_index=True, use_container_width=True)
+        st.caption("Out-of-fold predictions on the training set. 'Flagged' = share of patients at or above the "
+                   "threshold. The highlighted row is the one shown on the right.")
+    with right:
+        fig, cm = fig_confusion(y_train, p_k, t_sel)
+        show(fig)
+        tn, fp, fn_, tp = cm.ravel()
+        a, b = st.columns(2)
+        a.metric("Missed events", f"{fn_}", help="Patients with an event that were not flagged (false negatives)")
+        b.metric("False alarms", f"{fp}", help="Patients without an event that were flagged (false positives)")
+        a.metric("Sensitivity", f"{tp / max(tp + fn_, 1):.1%}")
+        b.metric("Precision", f"{tp / (tp + fp):.1%}" if tp + fp else "-")
+    row_b = tt[np.isclose(tt["threshold"], best)].iloc[0]
+    row_s = tt[np.isclose(tt["threshold"], t_sel)].iloc[0]
+    if np.isclose(t_sel, best):
+        st.success(f"Showing the recommended threshold {best:.2f} for Model {k}: {int(row_b['missed events'])} "
+                   f"missed events and {int(row_b['false alarms'])} false alarms "
+                   f"(weight {w}:1).")
+    else:
+        d_fn = int(row_s["missed events"] - row_b["missed events"])
+        d_fp = int(row_s["false alarms"] - row_b["false alarms"])
+        st.info(f"Threshold {t_sel:.2f} instead of the recommended {best:.2f}: {d_fn:+d} missed events and "
+                f"{d_fp:+d} false alarms.")
+
+
+def page_causal(raw):
+    st.header("Inference and causal analysis")
+    t_inf, t_cau = st.tabs(["Inference · survival at 24 months", "Causal · ZDV vs ZDV + ddI"])
+
+    with t_inf:
+        tab, curves, pairs = inference_results(raw)
+        st.caption("Kaplan-Meier estimate of the probability of staying event-free up to day 730, per treatment "
+                   "arm, using all patients (censored patients included). Intervals are 95 %: log-log "
+                   "transformation for each arm, Wald interval for the differences.")
+        st.subheader("Event-free probability at 730 days")
+        st.dataframe(pd.DataFrame({"Arm": [arm_label(a) for a in tab.index], "Event-free probability": tab.prob.values,
+                                   "SE (Greenwood)": tab.se.values, "95% CI lower": tab.lo.values,
+                                   "95% CI upper": tab.hi.values})
+                     .style.format({c: "{:.4f}" for c in ["Event-free probability", "SE (Greenwood)",
+                                                          "95% CI lower", "95% CI upper"]}),
+                     hide_index=True, use_container_width=True)
+        a, b = st.columns(2)
+        with a:
+            st.markdown("**Kaplan-Meier curves**")
+            show(fig_km(curves))
+        with b:
+            st.markdown("**Differences between arms (95% interval)**")
+            show(fig_forest(pairs))
+        st.subheader("All pairwise differences")
+        shown = pairs.rename(columns={"comparison": "Comparison", "difference": "Difference",
+                                      "lo": "95% CI lower", "hi": "95% CI upper"})
+        shown["Interval excludes 0?"] = np.where((pairs.lo > 0) | (pairs.hi < 0), "yes", "no")
+        st.dataframe(shown.style.format({c: "{:.4f}" for c in ["Difference", "95% CI lower", "95% CI upper"]}),
+                     hide_index=True, use_container_width=True)
+        clear = [r.comparison for r in pairs.itertuples() if r.lo > 0 or r.hi < 0]
+        unclear = [r.comparison for r in pairs.itertuples() if not (r.lo > 0 or r.hi < 0)]
+        st.caption("'Arm a vs Arm b' = event-free probability of a minus that of b (positive = a is better). "
+                   f"Intervals that exclude 0: {', '.join(clear) or 'none'}. "
+                   f"Intervals that include 0 (no clear difference): {', '.join(unclear) or 'none'}.")
+
+    with t_cau:
+        fit = causal_fit(raw)
+        st.caption("Question: how much would the 24-month event risk change if everybody received ZDV + ddI instead "
+                   "of ZDV alone? Only arms 0 and 1 are used. An unpenalised logistic regression adjusts for "
+                   "baseline covariates, then every patient is predicted twice (all on ZDV, all on ZDV + ddI) and the "
+                   "average risks are compared (marginal standardisation). Patients censored before day 730 count "
+                   "as 'no event', as in the notebook.")
+        boot = st.session_state.get("causal_ci")
+        ci, source = (boot, f"live bootstrap, {BOOT_N:,} resamples") if boot else (
+            CAUSAL_NOTEBOOK["ci"], "from the notebook, 1,000 bootstrap resamples")
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Risk if everyone got ZDV only", f"{fit['risk0']:.1%}")
+        m2.metric("Risk if everyone got ZDV + ddI", f"{fit['risk1']:.1%}")
+        m3.metric("Average treatment effect", f"{fit['ate'] * 100:+.1f} pp")
+        m4.metric("95% interval", f"[{ci[0] * 100:.1f}, {ci[1] * 100:.1f}] pp", help=source)
+        st.caption(f"Interval source: {source}. Based on {fit['n']:,} patients (arms 0 and 1).")
+        st.button(f"Recompute the interval here ({BOOT_N:,} bootstrap resamples)", on_click=run_bootstrap,
+                  args=(fit,), help="Takes a few seconds; the result can differ slightly from the notebook.")
+        st.markdown(f"Treating the whole population with ZDV + ddI instead of ZDV alone is estimated to change the "
+                    f"24-month event risk by **{fit['ate'] * 100:+.1f} percentage points** "
+                    f"(95% interval {ci[0] * 100:+.1f} to {ci[1] * 100:+.1f}). "
+                    + ("The interval excludes 0." if ci[1] < 0 or ci[0] > 0 else "The interval includes 0."))
+        with st.expander("The model behind the estimate"):
+            cf = fit["coef"].copy()
+            st.dataframe(cf.style.format({"log-odds": "{:.4f}", "odds ratio": "{:.3f}"}), hide_index=True,
+                         use_container_width=True)
+            or_trt = float(cf.loc[cf.feature == "trt", "odds ratio"].iloc[0])
+            st.caption(f"Intercept {fit['intercept']:.4f}. Holding the covariates fixed, ZDV + ddI multiplies the "
+                       f"odds of an event by {or_trt:.2f} (a {100 * (1 - or_trt):.0f} % reduction in odds).")
+
+        st.subheader("Do the arms look alike at baseline?")
+        st.caption("In a randomised trial the treatment groups should have similar baseline distributions, which is "
+                   "what makes the comparison above causal. Colours show the treatment arm.")
+        c1, c2, c3 = st.columns([2, 3, 1])
+        cov = c1.selectbox("Baseline measurement", ["age", "wtkg", "cd40", "cd80", "preanti"],
+                           format_func=lambda c: f"{c} - {DESC[c]}", key="cau_cov")
+        which = c2.radio("Arms", ["All four arms", "Only the two compared arms (0 and 1)"], horizontal=True,
+                         key="cau_arms")
+        bins = c3.slider("Bins", 10, 60, 25, key="cau_bins")
+        arms = [0, 1, 2, 3] if which.startswith("All") else [0, 1]
+        show(fig_overlay_hist([(arm_label(a), raw.loc[raw.trt == a, cov], ARM_COLOR[a], ARM_LINE[a]) for a in arms],
+                              bins, DESC[cov]))
+
+        st.subheader("Predicted risk if everyone received each treatment")
+        st.caption("Each patient's predicted 24-month event risk under ZDV only (grey) and under ZDV + ddI (navy). "
+                   "The shift between the two histograms is the treatment effect.")
+        show(fig_overlay_hist([("Everyone on ZDV only", fit["p0"], ARM_COLOR[0], ARM_LINE[0]),
+                               ("Everyone on ZDV + ddI", fit["p1"], ARM_COLOR[1], ARM_LINE[1])],
+                              30, "predicted 24-month event risk"))
 
 
 # ----------------------------------------------------------------------------------------
@@ -1028,8 +1360,10 @@ def main():
         page_explore(raw, lab)
     elif page == "model":
         page_modelling(lab, split)
-    else:
+    elif page == "results":
         page_results(split)
+    else:
+        page_causal(raw)
 
 
 if __name__ == "__main__":
