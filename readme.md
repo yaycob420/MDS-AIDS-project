@@ -31,12 +31,6 @@ This repository is divided into three distinct analytical tasks:
 * **pandas & numpy** (Data manipulation, Bootstrapping)
 * **matplotlib** (Survival curve visualizations)
 
-## Getting Started
+## App
 
-1. Clone this repository:
-   git clone https://github.com/yourusername/actg175-analysis.git
-
-2. Install the required dependencies:
-   pip install -r requirements.txt
-
-3. Run the Jupyter Notebook or Python scripts to reproduce the pipelines and causal estimates.
+[Click here for my app](https://mds-aids-project.streamlit.app/)
